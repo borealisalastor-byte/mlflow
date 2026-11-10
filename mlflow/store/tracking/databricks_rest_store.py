@@ -16,6 +16,8 @@ from mlflow.entities import (
     Assessment,
     Issue,
     IssueCategory,
+    IssueDetectionRun,
+    IssueDetectionRunStatus,
     IssueSeverity,
     IssueStatus,
     Span,
@@ -68,7 +70,15 @@ from mlflow.protos.databricks_tracing_pb2 import (
     UpdateAssessment,
 )
 from mlflow.protos.databricks_tracing_pb2 import TraceInfo as ProtoTraceInfo
-from mlflow.protos.issues_pb2 import CreateIssue, GetIssue, SearchIssues, UpdateIssue
+from mlflow.protos.issues_pb2 import (
+    CancelIssueDetectionRun,
+    CreateIssue,
+    DetectIssues,
+    GetIssue,
+    GetIssueDetectionRun,
+    SearchIssues,
+    UpdateIssue,
+)
 from mlflow.protos.service_pb2 import GetOnlineTraceDetails, MlflowService, SearchUnifiedTraces
 from mlflow.store.entities import PagedList
 from mlflow.store.tracking import SEARCH_TRACES_DEFAULT_MAX_RESULTS
@@ -1457,6 +1467,115 @@ class DatabricksTracingRestStore(RestStore):
             total_count=int(result["total_size"])
             if include_total_count and "total_size" in result
             else None,
+        )
+
+    @staticmethod
+    def _issue_detection_run_endpoint(experiment_id: str, run_id: str | None = None) -> str:
+        endpoint = append_to_uri_path(
+            _REST_API_PATH_PREFIX, "mlflow/experiments", quote(experiment_id, safe="")
+        )
+        if run_id is None:
+            return append_to_uri_path(endpoint, "issues:detect")
+        # Databricks names a run by its Jobs run ID. Issues it files carry that ID as
+        # `jobs:<id>`, so accept the prefixed form too.
+        return append_to_uri_path(
+            endpoint, "issue-detection-runs", quote(run_id.removeprefix("jobs:"), safe="")
+        )
+
+    @staticmethod
+    def _issue_detection_run_from_databricks_dict(
+        resource: dict[str, Any], experiment_id: str
+    ) -> IssueDetectionRun:
+        state = resource.get("state", "")
+        try:
+            status = IssueDetectionRunStatus(
+                state.removeprefix("ISSUE_DETECTION_RUN_STATE_").lower()
+            )
+        except ValueError:
+            raise MlflowException(
+                f"The Databricks Issues API returned an unrecognized run state {state!r}"
+            )
+        start_time = resource.get("start_time")
+        end_time = resource.get("end_time")
+        return IssueDetectionRun(
+            run_id=resource["job_run_id"],
+            experiment_id=experiment_id,
+            status=status,
+            start_time=proto_timestamp_to_milliseconds(start_time) if start_time else None,
+            end_time=proto_timestamp_to_milliseconds(end_time) if end_time else None,
+            error_message=resource.get("error_message"),
+        )
+
+    @staticmethod
+    def _require_issue_detection_ids(experiment_id: str | None, run_id: str | None = None):
+        if not isinstance(experiment_id, str) or not experiment_id:
+            raise MlflowException.invalid_parameter_value(
+                "experiment_id must be specified for issue detection on Databricks"
+            )
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise MlflowException.invalid_parameter_value("run_id must be a nonempty string")
+
+    def detect_issues(
+        self,
+        experiment_id: str,
+        *,
+        filter_string: str | None = None,
+        model: str | None = None,
+        trace_ids: list[str] | None = None,
+    ) -> IssueDetectionRun:
+        self._require_issue_detection_ids(experiment_id)
+        if model is not None:
+            raise MlflowException.invalid_parameter_value(
+                "`model` is not supported by the Databricks Issues API, which chooses the model "
+                "an issue detection run uses."
+            )
+        if trace_ids:
+            raise MlflowException.invalid_parameter_value(
+                "`trace_ids` is not supported by the Databricks Issues API. Select the traces to "
+                "analyze with `filter_string` instead."
+            )
+        body = {}
+        if filter_string:
+            body["filter"] = filter_string
+        # Detection reads traces in Unity Catalog through the run, so it takes the warehouse the
+        # client reads them with; without one, Databricks chooses the compute.
+        if sql_warehouse_id := MLFLOW_TRACING_SQL_WAREHOUSE_ID.get():
+            body["sql_warehouse_id"] = sql_warehouse_id
+        response = self._call_endpoint(
+            DetectIssues,
+            json.dumps(body),
+            endpoint=self._issue_detection_run_endpoint(experiment_id),
+            response_proto=Value(),
+        )
+        return self._issue_detection_run_from_databricks_dict(
+            MessageToDict(response)["issue_detection_run"], experiment_id
+        )
+
+    def get_issue_detection_run(
+        self, run_id: str, *, experiment_id: str | None = None
+    ) -> IssueDetectionRun:
+        self._require_issue_detection_ids(experiment_id, run_id)
+        response = self._call_endpoint(
+            GetIssueDetectionRun,
+            endpoint=self._issue_detection_run_endpoint(experiment_id, run_id),
+            response_proto=Value(),
+        )
+        return self._issue_detection_run_from_databricks_dict(
+            MessageToDict(response), experiment_id
+        )
+
+    def cancel_issue_detection_run(
+        self, run_id: str, *, experiment_id: str | None = None
+    ) -> IssueDetectionRun:
+        self._require_issue_detection_ids(experiment_id, run_id)
+        endpoint = append_to_uri_path(
+            self._issue_detection_run_endpoint(experiment_id, run_id), "cancel"
+        )
+        response = self._call_endpoint(
+            CancelIssueDetectionRun, json.dumps({}), endpoint=endpoint, response_proto=Value()
+        )
+        return self._issue_detection_run_from_databricks_dict(
+            MessageToDict(response)["issue_detection_run"], experiment_id
         )
 
     def _append_sql_warehouse_id_param(self, endpoint: str) -> str:
