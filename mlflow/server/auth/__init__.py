@@ -78,9 +78,11 @@ from mlflow.protos.databricks_pb2 import (
     ErrorCode,
 )
 from mlflow.protos.issues_pb2 import (
+    CancelIssueDetectionRun,
     CreateIssue,
     DetectIssues,
     GetIssue,
+    GetIssueDetectionRun,
     SearchIssues,
     UpdateIssue,
 )
@@ -504,6 +506,7 @@ from mlflow.store.tracking.skill_registry.artifact_paths import (
 )
 from mlflow.store.workspace.utils import get_default_workspace_optional
 from mlflow.utils import workspace_context
+from mlflow.utils.mlflow_tags import MLFLOW_ISSUE_DETECTION_JOB_ID
 from mlflow.utils.proto_json_utils import message_to_json, parse_dict
 from mlflow.utils.rest_utils import _REST_API_PATH_PREFIX
 from mlflow.utils.search_utils import (
@@ -5907,9 +5910,34 @@ def validate_can_detect_issues():
     return _get_gateway_secret_permission(secret_id).can_use
 
 
+def validate_can_cancel_issue_detection_run():
+    """
+    Canceling ends the run, so this requires UPDATE on it. Canceling also cancels its job, so,
+    as for ``PATCH /mlflow/jobs/cancel/<job_id>``, only the job's creator may do it.
+    """
+    from mlflow.server.jobs import get_job
+
+    if not _authorize_run("update"):
+        return False
+    try:
+        run = _get_tracking_store().get_run(_get_request_param("run_id"))
+        job_id = run.data.tags.get(MLFLOW_ISSUE_DETECTION_JOB_ID)
+        # No job leaves only the run to end, which UPDATE on it already covers.
+        if not job_id:
+            return True
+        creator = get_job(job_id).creator
+    except MlflowException as e:
+        if e.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
+            return False
+        raise
+    return creator is not None and creator == authenticate_request().username
+
+
 ISSUE_BEFORE_REQUEST_HANDLERS = {
     GetIssue: validate_can_read_issue,
     UpdateIssue: validate_can_update_issue,
+    GetIssueDetectionRun: validate_can_read_run,
+    CancelIssueDetectionRun: validate_can_cancel_issue_detection_run,
 }
 
 
